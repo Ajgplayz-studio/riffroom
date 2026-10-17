@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RiffRoom — Write riffs. Share links.</title>
 <meta name="description" content="RiffRoom: write songs in your browser and share them as links.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎹</text></svg>">
 <script>
 // GitHub Pages is just a forwarder — the real site lives on Cloudflare.
 if (location.hostname.indexOf('github.io') !== -1) {
@@ -163,10 +164,10 @@ if (location.hostname.indexOf('github.io') !== -1) {
 
     <div class="card">
       <h2>✨ AI Cover</h2>
-      <p class="hint" style="margin-top:0;">Choose an MP3 — the AI listens to its tempo and key, then reworks your song to match. Everything runs in your browser; the file never leaves your device.</p>
+      <p class="hint" style="margin-top:0;">Choose an MP3 — the AI listens and guesses the notes, Songsterr-style. Works best on clear melodies. Everything runs in your browser; the file never leaves your device.</p>
       <div class="btnrow">
         <label class="btn ghost">🎵 Choose MP3<input type="file" id="mp3File" accept="audio/mpeg,audio/*" style="display:none;"></label>
-        <button class="btn" id="genCover" onclick="generateCover()" disabled>✨ Generate cover</button>
+        <button class="btn" id="genCover" onclick="generateCover()" disabled>✨ Guess the notes</button>
         <button class="btn ghost" id="undoCover" style="display:none;" onclick="undoCover()">↩ Undo cover</button>
       </div>
       <div id="mp3Info" class="hint"></div>
@@ -263,7 +264,7 @@ function startPlayback(song, onTick) {
   const spb = 60 / song.bpm;
   const t0 = c.currentTime + 0.15;
   const oscs = song.n.map(n => {
-    try { return playTone(freqOf(n[1]), t0 + n[0] * spb, n[3] * spb, song.i); }
+    try { return playTone(freqOf(n[1]), t0 + n[0] * spb, n[2] * spb, song.i); }
     catch (e) { return null; }
   });
   const totalBeats = Math.max.apply(null, song.n.map(n => n[0] + n[2]).concat([4]));
@@ -454,48 +455,135 @@ async function analyzeMP3(file) {
     data = new Float32Array(c0.length);
     for (let i = 0; i < data.length; i++) data[i] = (c0[i] + c1[i]) * 0.5;
   }
-  // tempo: autocorrelate the onset-flux envelope
-  const hop = 1024, wins = Math.floor(data.length / hop);
+  // downsample to ~11kHz once — plenty for tempo + melody tracking, much faster
+  const factor = Math.max(1, Math.round(sr / 11025));
+  const ds = new Float32Array(Math.floor(data.length / factor));
+  for (let i = 0; i < ds.length; i++) ds[i] = data[i * factor];
+  const dsr = sr / factor;
+
+  // tempo: autocorrelate the onset-flux envelope (fractional lags so the
+  // window grid can't fake a half-time octave)
+  const hop = 128, wins = Math.floor(ds.length / hop);
   const flux = new Float32Array(Math.max(wins, 1));
   let prev = 0;
   for (let w = 0; w < wins; w++) {
     let e = 0;
-    const end = Math.min((w + 1) * hop, data.length);
-    for (let i = w * hop; i < end; i++) { const v = data[i]; e += v * v; }
+    const end = Math.min((w + 1) * hop, ds.length);
+    for (let i = w * hop; i < end; i++) { const v = ds[i]; e += v * v; }
     e = Math.sqrt(e / Math.max(1, end - w * hop));
     flux[w] = Math.max(0, e - prev);
     prev = e;
   }
-  const winSec = hop / sr;
+  const winSec = hop / dsr;
+  const tScore = (b) => {
+    const L = (60 / b) / winSec; // fractional lag in windows — no rounding
+    let s = 0, cnt = 0;
+    const lim = Math.ceil(L) + 1;
+    for (let w = 0; w + lim < wins; w += 3) {
+      const p = w + L, i0 = Math.floor(p), fr = p - i0;
+      const f2 = flux[i0] * (1 - fr) + (flux[i0 + 1] || 0) * fr;
+      s += flux[w] * f2; cnt++;
+    }
+    return cnt ? s / cnt : 0;
+  };
   let bpm = 120, bs = -1;
   for (let b = 60; b <= 200; b++) {
-    const lag = Math.max(1, Math.round(60 / b / winSec));
-    let s = 0, cnt = 0;
-    for (let w = 0; w + lag < wins; w += 3) { s += flux[w] * flux[w + lag]; cnt++; }
-    if (cnt) { s /= cnt; if (s > bs) { bs = s; bpm = b; } }
+    const s = tScore(b);
+    if (s > bs) { bs = s; bpm = b; }
   }
+  // octave correction: a 120 BPM song also correlates at 60 BPM — prefer the
+  // faster tempo when it fits the rhythm too
+  if (bpm * 2 <= 200 && tScore(bpm * 2) > bs * 0.55) bpm *= 2;
+
   // key center: pitch-class votes from windowed autocorrelation
   const votes = new Array(12).fill(0);
-  const N = 4096;
-  const nWin = Math.max(1, Math.min(8, Math.floor(data.length / (N * 6))));
+  const N = 1024;
+  const nWin = Math.max(1, Math.min(8, Math.floor(ds.length / (N * 6))));
   for (let k = 0; k < nWin; k++) {
-    const off = Math.max(0, Math.min(data.length - N, Math.floor((k + 0.5) * data.length / nWin) - N / 2));
-    const minLag = Math.max(2, Math.floor(sr / 520));
-    const maxLag = Math.min(N - 1, Math.floor(sr / 55));
+    const off = Math.max(0, Math.min(ds.length - N, Math.floor((k + 0.5) * ds.length / nWin) - N / 2));
+    const minLag = Math.max(2, Math.floor(dsr / 520));
+    const maxLag = Math.min(N - 1, Math.floor(dsr / 55));
     let bLag = minLag, bV = 0;
     for (let lag = minLag; lag <= maxLag; lag++) {
       let v = 0;
-      for (let i = 0; i < N - lag; i += 4) v += data[off + i] * data[off + i + lag];
+      for (let i = 0; i < N - lag; i += 4) v += ds[off + i] * ds[off + i + lag];
       if (v > bV) { bV = v; bLag = lag; }
     }
     if (bV > 0) {
-      const midi = Math.round(12 * Math.log2(sr / bLag / 440)) + 69;
+      const midi = Math.round(12 * Math.log2(dsr / bLag / 440)) + 69;
       votes[((midi % 12) + 12) % 12] += bV;
     }
   }
   let key = 0;
   for (let i = 0; i < 12; i++) if (votes[i] > votes[key]) key = i;
-  return { bpm, key, dur: buf.duration };
+  return { bpm, key, dur: buf.duration, data: ds, sr: dsr };
+}
+
+// Songsterr-style transcription: guess the predominant melody's notes.
+async function transcribeMelody(data, sr, bpm) {
+  const frameLen = 1024, hopLen = 256; // ~93ms window, ~23ms hop
+  const minLag = Math.max(2, Math.floor(sr / 880));
+  const maxLag = Math.floor(sr / 55);
+  const maxStart = Math.min(data.length - frameLen, sr * 240); // cap at 4 minutes
+  const seq = [];
+  for (let start = 0; start <= maxStart; start += hopLen) {
+    let e = 0;
+    for (let i = 0; i < frameLen; i += 2) { const v = data[start + i]; e += v * v; }
+    e /= (frameLen / 2);
+    let bLag = minLag, bV = 0;
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      let v = 0;
+      for (let i = 0; i < frameLen - lag; i += 8) v += data[start + i] * data[start + i + lag];
+      if (v > bV) { bV = v; bLag = lag; }
+    }
+    // voicing gate: weak periodicity = rest, not a note
+    // (bV sums every 8th sample, so scale back up before normalizing)
+    const norm = (bV * 8) / (frameLen * e + 1e-9);
+    if (norm > 0.3) {
+      seq.push({ t: start / sr, midi: Math.round(69 + 12 * Math.log2((sr / bLag) / 440)) });
+    } else {
+      seq.push(null);
+    }
+    // let the UI breathe on long files
+    if (seq.length % 800 === 0) await new Promise(r => setTimeout(r, 0));
+  }
+  // median-filter the pitch to kill jitter
+  const sm = seq.map((s, i) => {
+    if (!s) return null;
+    const vals = [];
+    for (let k = -2; k <= 2; k++) { const o = seq[i + k]; if (o) vals.push(o.midi); }
+    vals.sort((a, b) => a - b);
+    return { t: s.t, midi: vals[Math.floor(vals.length / 2)] };
+  });
+  // merge into notes — with hysteresis: a new pitch must hold for 3 frames
+  // before it starts a note, so transition smears don't become blip notes
+  const hopSec = hopLen / sr;
+  const rawNotes = [];
+  let cur = null, pend = null, pendCount = 0;
+  sm.forEach(s => {
+    const m = s ? s.midi : null;
+    if (m === null) {
+      if (cur) { rawNotes.push(cur); cur = null; }
+      pend = null; pendCount = 0;
+      return;
+    }
+    if (cur && m === cur.midi) { cur.lastT = s.t; pend = null; pendCount = 0; return; }
+    if (pend === m) pendCount++;
+    else { pend = m; pendCount = 1; }
+    if (pendCount >= 3) {
+      if (cur) rawNotes.push(cur);
+      cur = { midi: m, startT: s.t - (pendCount - 1) * hopSec, lastT: s.t };
+      pend = null; pendCount = 0;
+    }
+  });
+  if (cur) rawNotes.push(cur);
+  // to beats, quantized to 16ths
+  const bps = bpm / 60;
+  return rawNotes.map(n => {
+    const b = Math.round(n.startT * bps * 4) / 4;
+    const d = Math.max(0.25, Math.round((n.lastT - n.startT + frameLen / sr) * bps * 4) / 4);
+    return [b, Math.max(21, Math.min(108, n.midi)), d];
+  }).filter(n => n[2] > 0).slice(0, 2000);
 }
 document.getElementById('mp3File').addEventListener('change', async (e) => {
   const f = e.target.files[0];
@@ -518,29 +606,39 @@ document.getElementById('mp3File').addEventListener('change', async (e) => {
     info.textContent = 'Could not read that file — try a different MP3.';
   }
 });
-function generateCover() {
-  if (!mp3Analysis || !song.n.length) return;
+async function generateCover() {
+  const info = document.getElementById('mp3Info');
+  const gen = document.getElementById('genCover');
+  if (!mp3Analysis) { info.textContent = 'Choose an MP3 first.'; return; }
   syncSongFromInputs();
-  songBackup = JSON.parse(JSON.stringify(song));
-  // find the song's own key center (duration-weighted pitch classes)
-  const w = new Array(12).fill(0);
-  song.n.forEach(n => { w[((n[1] % 12) + 12) % 12] += n[2]; });
-  let upc = 0;
-  for (let i = 0; i < 12; i++) if (w[i] > w[upc]) upc = i;
-  let shift = mp3Analysis.key - upc;
-  if (shift > 6) shift -= 12;
-  if (shift < -6) shift += 12;
-  song.n = song.n.map(n => {
-    let m = Math.max(21, Math.min(108, n[1] + shift));
-    return [n[0], m, n[2]];
-  });
-  song.bpm = Math.min(240, Math.max(40, mp3Analysis.bpm));
-  document.getElementById('songBpm').value = song.bpm;
-  song.t = songBackup.t.replace(/ \(AI cover.*\)$/, '') + ' (AI cover · ' + mp3Name.replace(/\.[^.]+$/, '') + ')';
-  document.getElementById('songTitle').value = song.t;
-  renderNoteList();
-  renderSheet();
-  document.getElementById('undoCover').style.display = '';
+  gen.disabled = true;
+  info.textContent = '🎧 Guessing the notes… (a few seconds)';
+  await new Promise(r => setTimeout(r, 30)); // let the message paint first
+  try {
+    const notes = await transcribeMelody(mp3Analysis.data, mp3Analysis.sr, mp3Analysis.bpm);
+    if (!notes.length) {
+      info.textContent = 'Could not find a clear melody in that MP3 — try another one.';
+      gen.disabled = false;
+      return;
+    }
+    songBackup = JSON.parse(JSON.stringify(song));
+    song.n = notes;
+    song.bpm = Math.min(240, Math.max(40, mp3Analysis.bpm));
+    document.getElementById('songBpm').value = song.bpm;
+    song.t = songBackup.t.replace(/ \(AI (cover|notes).*\)$/, '') +
+      ' (AI notes · ' + mp3Name.replace(/\.[^.]+$/, '') + ')';
+    document.getElementById('songTitle').value = song.t;
+    const lastBeat = Math.max.apply(null, notes.map(n => n[0] + n[2]));
+    if (lastBeat > sheetBeats) sheetBeats = Math.ceil(lastBeat / 4) * 4;
+    renderNoteList();
+    renderSheet();
+    document.getElementById('undoCover').style.display = '';
+    info.textContent = '🎧 ' + mp3Name + ' — guessed ' + notes.length + ' notes at ~' +
+      mp3Analysis.bpm + ' BPM. Tweak anything that sounds off!';
+  } catch (err) {
+    info.textContent = 'Something went wrong reading that MP3 — try another one.';
+  }
+  gen.disabled = false;
 }
 function undoCover() {
   if (!songBackup) return;
