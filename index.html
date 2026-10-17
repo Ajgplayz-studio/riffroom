@@ -271,6 +271,14 @@ if (location.hostname.indexOf('github.io') !== -1) {
       <button class="playbtn" id="btnPlayP" onclick="togglePlayPlayer()" title="Play">▶</button>
       <button class="btn ghost" onclick="goEditor()">✏️ Make your own song</button>
     </div>
+    <div id="pabWrap" style="display:none;margin-top:14px;">
+      <div class="seg">
+        <button class="segopt" id="psegOrig" onclick="pabPlay('orig')">🎧 Original</button>
+        <button class="segopt active" id="psegAI" onclick="pabPlay('ai')">🤖 AI notes</button>
+      </div>
+      <audio id="pabAudio" controls style="width:100%;margin-top:10px;"></audio>
+      <div id="pabInfo" class="hint"></div>
+    </div>
     <div class="sheet-scroll" id="pwrap"><div id="ptimeline"></div></div>
     <p class="hint">The green box follows the music as it plays.</p>
   </div>
@@ -300,6 +308,7 @@ function validateSong(s) {
     if (!INSTRUMENTS.includes(s.i)) s.i = 'guitar';
   }
   if (!INSTRUMENTS.includes(s.i)) s.i = 'piano';
+  if (s.yt != null && typeof s.yt !== 'string') delete s.yt;
   s.n = s.n.filter(n => Array.isArray(n) && n.length >= 3 &&
     isFinite(n[0]) && n[0] >= 0 && isFinite(n[1]) && n[1] >= 0 && n[1] <= 127 && n[2] > 0).slice(0, 2000);
   return s;
@@ -811,6 +820,7 @@ let mp3Analysis = null;
 let mp3Name = '';
 let mp3FileChosen = null;
 let ytAudioBuf = null;   // decoded AudioBuffer from a YouTube import
+let ytWatchURL = null;  // canonical watch URL, shared in songdata so players can fetch the original
 let origAudioURL = null; // blob/object URL of the original audio (MP3 or YouTube)
 function fmtDur(s) { s = Math.round(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 async function analyzeMP3(file) {
@@ -964,6 +974,7 @@ document.getElementById('mp3File').addEventListener('change', async (e) => {
   mp3FileChosen = f;
   mp3Analysis = null;
   ytAudioBuf = null; // MP3 takes over from any YouTube import
+  ytWatchURL = null;
   const info = document.getElementById('mp3Info');
   const gen = document.getElementById('genCover');
   gen.disabled = true;
@@ -1042,6 +1053,7 @@ async function importYouTube() {
     const buf = await ac().decodeAudioData(bytes.slice(0));
     if (!buf || buf.duration < 1) throw new Error('undecodable');
     ytAudioBuf = buf;
+    ytWatchURL = 'https://www.youtube.com/watch?v=' + id;
     mp3Analysis = analyzeBuffer(buf);
     mp3Name = String(title || 'YouTube audio').replace(/\.[^.]+$/, '');
     origAudioURL = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
@@ -1138,6 +1150,31 @@ function monophonicLine(notes) {
   }
   return kept;
 }
+function capPolyphony(notes, max) {
+  // Sweep line: where more than `max` notes overlap, the quietest are dropped.
+  // A guitar has 6 strings — anything beyond a handful of simultaneous notes
+  // is almost always detector mud, not music.
+  const sorted = notes.slice().sort((a, b) => a.t - b.t);
+  const events = [];
+  sorted.forEach(n => {
+    events.push({ t: n.t, type: 1, n });
+    events.push({ t: n.t + n.d, type: -1, n });
+  });
+  events.sort((a, b) => a.t - b.t || a.type - b.type); // note-offs before note-ons
+  const dropped = new Set();
+  const cur = new Set();
+  for (const e of events) {
+    if (e.type === -1) { cur.delete(e.n); continue; }
+    cur.add(e.n);
+    if (cur.size > max) {
+      let q = null;
+      cur.forEach(n => { if (!q || n.a < q.a) q = n; });
+      cur.delete(q);
+      dropped.add(q);
+    }
+  }
+  return sorted.filter(n => !dropped.has(n));
+}
 function aiNotesToRiff(aiNotes, bpm, melodyOnly) {
   // merge same-pitch notes that overlap/touch (the model sometimes fragments).
   // sort pitch-first so same-pitch notes are adjacent even in polyphony.
@@ -1158,7 +1195,13 @@ function aiNotesToRiff(aiNotes, bpm, melodyOnly) {
     }
   });
   let line = merged.sort((a, b) => a.t - b.t);
+  // adaptive gate: drop notes fainter than 22% of the loudest — these are
+  // detector ghosts, not music. (Especially important on "lots of notes".)
+  let maxA = 0;
+  line.forEach(n => { if (n.a > maxA) maxA = n.a; });
+  if (maxA > 0) line = line.filter(n => n.a >= maxA * 0.22);
   if (melodyOnly) line = monophonicLine(line);
+  else line = capPolyphony(line, 8);
   const bps = bpm / 60;
   return line
     .map(n => [
@@ -1211,6 +1254,7 @@ async function runAITranscription() {
     }
     songBackup = JSON.parse(JSON.stringify(song));
     song.n = notes;
+    song.yt = ytAudioBuf ? ytWatchURL : null; // players re-fetch the original from this
     song.bpm = Math.min(240, Math.max(40, mp3Analysis.bpm));
     document.getElementById('songBpm').value = song.bpm;
     song.t = songBackup.t.replace(/ \(AI (cover|notes).*\)$/, '') +
@@ -1244,6 +1288,42 @@ function undoCover() {
 
 /* ================= player view ================= */
 const INST_LABEL = { piano: '🎹 Piano', guitar: '🎸 Guitar', bass: '🎻 Bass', synth: '🎛 Synth' };
+let pabAudioURL = null, pabLoading = false;
+function pmarkAB(which) {
+  const o = document.getElementById('psegOrig'), a = document.getElementById('psegAI');
+  if (o) o.classList.toggle('active', which === 'orig');
+  if (a) a.classList.toggle('active', which === 'ai');
+}
+async function pabPlay(which) {
+  const aud = document.getElementById('pabAudio');
+  const info = document.getElementById('pabInfo');
+  if (!aud) return;
+  pmarkAB(which);
+  if (which === 'orig') {
+    stopPlayback();
+    if (!pabAudioURL && !pabLoading && song.yt) {
+      pabLoading = true;
+      info.textContent = '🔍 Fetching the original…';
+      try {
+        const { url } = await resolveYouTubeAudio(ytID(song.yt));
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('download failed');
+        const bytes = await resp.arrayBuffer();
+        if (bytes.byteLength < 10000) throw new Error('empty');
+        pabAudioURL = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+        aud.src = pabAudioURL;
+        info.textContent = '';
+      } catch (e) {
+        info.textContent = '⚠️ Couldn\'t fetch the original right now — the AI version still plays fine.';
+      }
+      pabLoading = false;
+    }
+    if (pabAudioURL) aud.play().catch(() => {});
+  } else {
+    aud.pause();
+    if (pb) stopPlayback(); else togglePlayPlayer();
+  }
+}
 function renderPlayer() {
   document.getElementById('pTitle').textContent = song.t;
   document.getElementById('pBpm').textContent = song.bpm + ' BPM';
@@ -1255,12 +1335,20 @@ function renderPlayer() {
   const cur = document.createElement('div');
   cur.id = 'tabCursor';
   pt.appendChild(cur);
+  // player A/B: only songs transcribed from YouTube carry the original's link
+  const pab = document.getElementById('pabWrap');
+  const paud = document.getElementById('pabAudio');
+  if (pab) pab.style.display = song.yt ? 'block' : 'none';
+  if (paud) paud.onplay = () => { stopPlayback(); pmarkAB('orig'); };
 }
 function togglePlayPlayer() {
   if (pb) { stopPlayback(); return; }
   const aud = document.getElementById('abAudio');
   if (aud) aud.pause();
   markAB('ai');
+  const paud = document.getElementById('pabAudio');
+  if (paud) paud.pause();
+  pmarkAB('ai');
   startPlayback(song, (el) => {
     const cur = document.getElementById('tabCursor');
     if (cur) {
