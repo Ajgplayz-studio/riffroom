@@ -247,6 +247,19 @@ if (location.hostname.indexOf('github.io') !== -1) {
           </select>
         </div>
         <label class="chk" title="Keeps one instrument's line, like a Songsterr tab"><input type="checkbox" id="aiMelody" checked> 🎯 Melody only</label>
+        <div class="field">AI engine
+          <div class="seg" style="margin-top:6px;">
+            <button class="segopt active" id="engBasic" onclick="setEngine('basic')">🎵 Basic Pitch</button>
+            <button class="segopt" id="engGemini" onclick="setEngine('gemini')">✨ Gemini</button>
+          </div>
+          <input type="hidden" id="aiEngine" value="basic">
+        </div>
+        <div class="field" id="gemKeyWrap" style="display:none;min-width:220px;">
+          <b>✨ Using Gemini</b>
+          <span class="hint">1. Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a><br>2. Paste it below, then hit ✨ Guess the notes<br>3. You'll paste a fresh key every time — it's never saved, only sent to Google</span>
+          Gemini API key
+          <input type="password" id="gemKey" placeholder="Paste key here" autocomplete="off" style="width:220px;">
+        </div>
         <button class="btn ghost" id="undoCover" style="display:none;" onclick="undoCover()">↩ Undo cover</button>
       </div>
       <div id="mp3Info" class="hint"></div>
@@ -1121,6 +1134,105 @@ const AI_SENS = {
   balanced: [0.25, 0.25, 5],
   hungry:   [0.12, 0.12, 3]
 };
+// ---- Gemini transcription: listens like a person, picks the lead line ----
+const GEMINI_MODEL = 'gemini-2.5-flash';
+function gemKey() {
+  const el = document.getElementById('gemKey');
+  return ((el && el.value) || '').trim(); // never stored — asked fresh every transcribe
+}
+function setEngine(which) {
+  document.getElementById('aiEngine').value = which;
+  document.getElementById('engBasic').classList.toggle('active', which === 'basic');
+  document.getElementById('engGemini').classList.toggle('active', which === 'gemini');
+  const gkw = document.getElementById('gemKeyWrap');
+  if (gkw) gkw.style.display = which === 'gemini' ? '' : 'none';
+}
+function floatToWAVBytes(mono, sampleRate) {
+  const n = mono.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const wstr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  wstr(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); wstr(8, 'WAVE');
+  wstr(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wstr(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buf;
+}
+function b64encode(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+function parseGeminiNotes(text) {
+  const m = String(text).match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  let arr;
+  try { arr = JSON.parse(m[0]); } catch (e) { return []; }
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .filter(n => n && isFinite(n.s) && isFinite(n.d) && isFinite(n.m))
+    .map(n => ({
+      startTimeSeconds: Math.max(0, +n.s),
+      durationSeconds: Math.max(0.05, +n.d),
+      pitchMidi: Math.max(21, Math.min(108, Math.round(+n.m))),
+      amplitude: 0.7
+    }));
+}
+async function getDecodedBuffer() {
+  if (ytAudioBuf) return ytAudioBuf;
+  const raw = await mp3FileChosen.arrayBuffer();
+  return ac().decodeAudioData(raw);
+}
+async function transcribeWithGemini(audioBuf, apiKey, onProgress) {
+  const prog = (f) => { if (onProgress) onProgress(f); };
+  prog(0.05);
+  await new Promise(r => setTimeout(r, 30));
+  const mono = await resampleBuffer(audioBuf, 180); // first 3 minutes
+  const wav = floatToWAVBytes(mono, 22050);
+  prog(0.3);
+  const b64 = b64encode(wav);
+  const prompt =
+    'Transcribe the main melody of this audio into musical notes.\n' +
+    'Return ONLY a JSON array (no markdown, no explanation), like:\n' +
+    '[{"s":0.0,"d":0.45,"m":69},{"s":0.5,"d":0.5,"m":71}]\n' +
+    '- s = note start time in seconds (as precise as you can)\n' +
+    '- d = note duration in seconds\n' +
+    '- m = MIDI pitch 21-108 (60 = middle C, 69 = A440)\n' +
+    'Rules: transcribe the single most prominent lead line (vocal or lead instrument). ' +
+    'In a full band mix, follow the lead and ignore the backing. ' +
+    'List notes in time order, one entry per note, every note you hear in the lead line. ' +
+    'Do not invent notes. If a section has no clear melody, skip it.';
+  prog(0.45);
+  const r = await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL +
+    ':generateContent?key=' + encodeURIComponent(apiKey),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: 'audio/wav', data: b64 } }] }],
+        generationConfig: { temperature: 0.15, maxOutputTokens: 65536 }
+      })
+    }
+  );
+  if (!r.ok) throw new Error('gemini http ' + r.status);
+  const j = await r.json();
+  const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
+  const text = parts.map(x => x.text || '').join('');
+  prog(0.9);
+  const notes = parseGeminiNotes(text);
+  if (!notes.length) throw new Error('gemini returned no notes');
+  prog(1);
+  return notes;
+}
 async function transcribeWithAI(mono22050, onProgress, sens) {
   const bp = await loadAILib();
   if (!aiModel) aiModel = new bp.BasicPitch(BP_MODEL_URL);
@@ -1230,22 +1342,46 @@ async function runAITranscription() {
     await new Promise(r => setTimeout(r, 30));
     const mono = ytAudioBuf ? await resampleBuffer(ytAudioBuf, 240) : await resample22050(mp3FileChosen, 240);
     let notes, engine, melodyOnly = false;
+    const wantGemini = document.getElementById('aiEngine').value === 'gemini';
     try {
-      info.textContent = '🧠 Loading the AI (one-time download)…';
-      await new Promise(r => setTimeout(r, 30));
       const sens = AI_SENS[document.getElementById('aiSens').value] || AI_SENS.hungry;
       melodyOnly = document.getElementById('aiMelody').checked;
-      const aiNotes = await transcribeWithAI(mono, (p) => {
-        info.textContent = '🧠 AI is listening… ' + Math.round(p * 100) + '%';
-      }, sens);
-      notes = aiNotesToRiff(aiNotes, mp3Analysis.bpm, melodyOnly);
-      engine = 'ai';
+      if (wantGemini) {
+        const key = gemKey();
+        if (!key) {
+          info.textContent = '🔑 Paste your Gemini API key first — free at aistudio.google.com/apikey';
+          gen.disabled = false;
+          return;
+        }
+        info.textContent = '✨ Preparing audio for Gemini…';
+        await new Promise(r => setTimeout(r, 30));
+        const dec = await getDecodedBuffer();
+        const gNotes = await transcribeWithGemini(dec, key, (p) => {
+          info.textContent = '✨ Gemini is listening… ' + Math.round(p * 100) + '%';
+        });
+        notes = aiNotesToRiff(gNotes, mp3Analysis.bpm, melodyOnly);
+        engine = 'gemini';
+      } else {
+        info.textContent = '🧠 Loading the AI (one-time download)…';
+        await new Promise(r => setTimeout(r, 30));
+        const aiNotes = await transcribeWithAI(mono, (p) => {
+          info.textContent = '🧠 AI is listening… ' + Math.round(p * 100) + '%';
+        }, sens);
+        notes = aiNotesToRiff(aiNotes, mp3Analysis.bpm, melodyOnly);
+        engine = 'ai';
+      }
     } catch (aiErr) {
-      // offline or CDN blocked: fall back to the classic DSP guesser
-      info.textContent = '⚠️ AI would not load — using the classic guesser instead…';
+      // offline, CDN blocked, or Gemini failed: fall back to the classic DSP guesser
+      info.textContent = '⚠️ ' + (wantGemini ? 'Gemini didn\'t answer' : 'AI would not load') +
+        ' — using the classic guesser instead…';
       await new Promise(r => setTimeout(r, 30));
       notes = await transcribeMelody(mp3Analysis.data, mp3Analysis.sr, mp3Analysis.bpm);
       engine = 'dsp';
+    }
+    if (wantGemini) {
+      // key is single-use: clear it so every transcribe asks fresh
+      const gk = document.getElementById('gemKey');
+      if (gk) gk.value = '';
     }
     if (!notes.length) {
       info.textContent = 'Could not find notes in that MP3 — try another one.';
@@ -1265,8 +1401,9 @@ async function runAITranscription() {
     renderNoteList();
     renderSheet();
     document.getElementById('undoCover').style.display = '';
-    info.textContent = (engine === 'ai' ? '🧠' : '🎧') + ' ' + mp3Name + ' — guessed ' +
-      notes.length + ' notes' + (engine === 'ai' && melodyOnly ? ' (melody line)' : '') +
+    const eicon = engine === 'gemini' ? '✨' : engine === 'ai' ? '🧠' : '🎧';
+    info.textContent = eicon + ' ' + mp3Name + ' — guessed ' +
+      notes.length + ' notes' + (engine !== 'dsp' && melodyOnly ? ' (melody line)' : '') +
       ' at ~' + mp3Analysis.bpm + ' BPM. Tweak anything that sounds off!';
     showAB();
   } catch (err) {
@@ -1371,6 +1508,8 @@ function togglePlayPlayer() {
   });
   const abAud = document.getElementById('abAudio');
   if (abAud) abAud.addEventListener('play', () => { stopPlayback(); markAB('orig'); });
+  // Gemini keys are never stored: wipe any key saved by older versions
+  try { localStorage.removeItem('riffroom_gemini_key'); } catch (e) {}
   if (sd) {
     try {
       song = validateSong(decodeSong(sd));
