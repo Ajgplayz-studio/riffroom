@@ -168,6 +168,13 @@ if (location.hostname.indexOf('github.io') !== -1) {
       <div class="btnrow">
         <label class="btn ghost">🎵 Choose MP3<input type="file" id="mp3File" accept="audio/mpeg,audio/*" style="display:none;"></label>
         <button class="btn" id="genCover" onclick="generateCover()" disabled>✨ Guess the notes</button>
+        <div class="field">Note detail
+          <select id="aiSens" title="How many notes the AI picks up">
+            <option value="hungry" selected>🍽️ Lots of notes</option>
+            <option value="balanced">⚖️ Balanced</option>
+            <option value="precise">🎯 Only confident notes</option>
+          </select>
+        </div>
         <button class="btn ghost" id="undoCover" style="display:none;" onclick="undoCover()">↩ Undo cover</button>
       </div>
       <div id="mp3Info" class="hint"></div>
@@ -626,7 +633,13 @@ async function resample22050(file, maxSec) {
   src.start(0, 0, dur);
   return (await off.startRendering()).getChannelData(0);
 }
-async function transcribeWithAI(mono22050, onProgress) {
+// sensitivity presets: [onsetThresh, frameThresh, minNoteLenFrames]
+const AI_SENS = {
+  precise:  [0.40, 0.35, 8],
+  balanced: [0.25, 0.25, 5],
+  hungry:   [0.12, 0.12, 3]
+};
+async function transcribeWithAI(mono22050, onProgress, sens) {
   const bp = await loadAILib();
   if (!aiModel) aiModel = new bp.BasicPitch(BP_MODEL_URL);
   const frames = [], onsets = [], contours = [];
@@ -636,7 +649,7 @@ async function transcribeWithAI(mono22050, onProgress) {
     (p) => { if (onProgress) onProgress(p); }
   );
   return bp.noteFramesToTime(
-    bp.addPitchBendsToNoteEvents(contours, bp.outputToNotesPoly(frames, onsets, 0.25, 0.25, 5))
+    bp.addPitchBendsToNoteEvents(contours, bp.outputToNotesPoly(frames, onsets, sens[0], sens[1], sens[2]))
   );
 }
 function aiNotesToRiff(aiNotes, bpm) {
@@ -681,9 +694,10 @@ async function generateCover() {
     try {
       info.textContent = '🧠 Loading the AI (one-time download)…';
       await new Promise(r => setTimeout(r, 30));
+      const sens = AI_SENS[document.getElementById('aiSens').value] || AI_SENS.hungry;
       const aiNotes = await transcribeWithAI(mono, (p) => {
         info.textContent = '🧠 AI is listening… ' + Math.round(p * 100) + '%';
-      });
+      }, sens);
       notes = aiNotesToRiff(aiNotes, mp3Analysis.bpm);
       engine = 'ai';
     } catch (aiErr) {
