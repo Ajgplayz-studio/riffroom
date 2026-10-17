@@ -259,6 +259,9 @@ if (location.hostname.indexOf('github.io') !== -1) {
           <span class="hint">1. Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a><br>2. Paste it below, then hit ✨ Guess the notes<br>3. You'll paste a fresh key every time — it's never saved, only sent to Google</span>
           Gemini API key
           <input type="password" id="gemKey" placeholder="Paste key here" autocomplete="off" style="width:220px;">
+          Focus on… (optional)
+          <input type="text" id="gemFocus" placeholder="e.g. lead vocals, guitar solo, bass" autocomplete="off" style="width:220px;">
+          <span class="hint">Tells Gemini which line to follow when the mix is busy</span>
         </div>
         <button class="btn ghost" id="undoCover" style="display:none;" onclick="undoCover()">↩ Undo cover</button>
       </div>
@@ -994,8 +997,11 @@ document.getElementById('mp3File').addEventListener('change', async (e) => {
   info.textContent = '🎧 Listening to ' + f.name + '…';
   try {
     mp3Analysis = await analyzeMP3(f);
+    const detBpm = Math.min(240, Math.max(40, Math.round(mp3Analysis.bpm)));
+    document.getElementById('songBpm').value = detBpm; // user can correct before transcribing
     info.textContent = '🎧 ' + f.name + ' — about ' + mp3Analysis.bpm + ' BPM · centered on ' +
-      NOTE_NAMES[mp3Analysis.key] + ' · ' + fmtDur(mp3Analysis.dur);
+      NOTE_NAMES[mp3Analysis.key] + ' · ' + fmtDur(mp3Analysis.dur) +
+      ' · if the BPM looks wrong, fix it in the Song box before hitting Guess the notes';
     const prev = document.getElementById('mp3Prev');
     origAudioURL = URL.createObjectURL(f);
     prev.src = origAudioURL;
@@ -1068,6 +1074,8 @@ async function importYouTube() {
     ytAudioBuf = buf;
     ytWatchURL = 'https://www.youtube.com/watch?v=' + id;
     mp3Analysis = analyzeBuffer(buf);
+    document.getElementById('songBpm').value =
+      Math.min(240, Math.max(40, Math.round(mp3Analysis.bpm))); // user can correct before transcribing
     mp3Name = String(title || 'YouTube audio').replace(/\.[^.]+$/, '');
     origAudioURL = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
     info.textContent = '✅ Got it — now the AI listens…';
@@ -1199,16 +1207,20 @@ async function transcribeWithGemini(audioBuf, apiKey, onProgress) {
   const wav = floatToWAVBytes(mono, 22050);
   prog(0.3);
   const b64 = b64encode(wav);
+  const focusEl = document.getElementById('gemFocus');
+  const focus = (focusEl && focusEl.value || '').trim().slice(0, 60);
   const prompt =
-    'Transcribe the main melody of this audio into musical notes.\n' +
+    'Transcribe the notes of this audio.\n' +
+    (focus
+      ? 'Focus ONLY on the ' + focus + ' and ignore all other instruments and voices. '
+      : 'Transcribe the single most prominent lead line (vocal or lead instrument). In a full band mix, follow the lead and ignore the backing. ') +
     'Return ONLY a JSON array (no markdown, no explanation), like:\n' +
     '[{"s":0.0,"d":0.45,"m":69},{"s":0.5,"d":0.5,"m":71}]\n' +
     '- s = note start time in seconds (as precise as you can)\n' +
     '- d = note duration in seconds\n' +
-    '- m = MIDI pitch 21-108 (60 = middle C, 69 = A440)\n' +
-    'Rules: transcribe the single most prominent lead line (vocal or lead instrument). ' +
-    'In a full band mix, follow the lead and ignore the backing. ' +
-    'List notes in time order, one entry per note, every note you hear in the lead line. ' +
+    '- m = MIDI pitch 21-108 (60 = middle C, 69 = A440). Preserve the true octave — do not transpose.\n' +
+    'Rules: list notes in time order, one entry per note, every note you hear' +
+    (focus ? ' in the ' + focus : ' in the lead line') + '. ' +
     'Do not invent notes. If a section has no clear melody, skip it.';
   prog(0.45);
   const r = await fetch(
@@ -1332,6 +1344,13 @@ async function generateCover() {
   if (!mp3FileChosen && !ytAudioBuf) { info.textContent = 'Choose an MP3 first.'; return; }
   await runAITranscription();
 }
+// The BPM box (pre-filled from analysis, user-correctable) is the source of
+// truth for transcription — never blindly trust the detector.
+function aiBpm() {
+  const v = parseFloat(document.getElementById('songBpm').value);
+  if (isFinite(v) && v >= 40 && v <= 240) return Math.round(v);
+  return Math.min(240, Math.max(40, Math.round(mp3Analysis.bpm)));
+}
 async function runAITranscription() {
   const info = document.getElementById('mp3Info');
   const gen = document.getElementById('genCover');
@@ -1341,6 +1360,7 @@ async function runAITranscription() {
     info.textContent = '🎧 Preparing audio…';
     await new Promise(r => setTimeout(r, 30));
     const mono = ytAudioBuf ? await resampleBuffer(ytAudioBuf, 240) : await resample22050(mp3FileChosen, 240);
+    const bpm = aiBpm();
     let notes, engine, melodyOnly = false;
     const wantGemini = document.getElementById('aiEngine').value === 'gemini';
     try {
@@ -1359,7 +1379,7 @@ async function runAITranscription() {
         const gNotes = await transcribeWithGemini(dec, key, (p) => {
           info.textContent = '✨ Gemini is listening… ' + Math.round(p * 100) + '%';
         });
-        notes = aiNotesToRiff(gNotes, mp3Analysis.bpm, melodyOnly);
+        notes = aiNotesToRiff(gNotes, bpm, melodyOnly);
         engine = 'gemini';
       } else {
         info.textContent = '🧠 Loading the AI (one-time download)…';
@@ -1367,7 +1387,7 @@ async function runAITranscription() {
         const aiNotes = await transcribeWithAI(mono, (p) => {
           info.textContent = '🧠 AI is listening… ' + Math.round(p * 100) + '%';
         }, sens);
-        notes = aiNotesToRiff(aiNotes, mp3Analysis.bpm, melodyOnly);
+        notes = aiNotesToRiff(aiNotes, bpm, melodyOnly);
         engine = 'ai';
       }
     } catch (aiErr) {
@@ -1375,7 +1395,7 @@ async function runAITranscription() {
       info.textContent = '⚠️ ' + (wantGemini ? 'Gemini didn\'t answer' : 'AI would not load') +
         ' — using the classic guesser instead…';
       await new Promise(r => setTimeout(r, 30));
-      notes = await transcribeMelody(mp3Analysis.data, mp3Analysis.sr, mp3Analysis.bpm);
+      notes = await transcribeMelody(mp3Analysis.data, mp3Analysis.sr, bpm);
       engine = 'dsp';
     }
     if (wantGemini) {
@@ -1391,7 +1411,7 @@ async function runAITranscription() {
     songBackup = JSON.parse(JSON.stringify(song));
     song.n = notes;
     song.yt = ytAudioBuf ? ytWatchURL : null; // players re-fetch the original from this
-    song.bpm = Math.min(240, Math.max(40, mp3Analysis.bpm));
+    song.bpm = bpm;
     document.getElementById('songBpm').value = song.bpm;
     song.t = songBackup.t.replace(/ \(AI (cover|notes).*\)$/, '') +
       ' (AI notes · ' + mp3Name.replace(/\.[^.]+$/, '') + ')';
@@ -1404,7 +1424,7 @@ async function runAITranscription() {
     const eicon = engine === 'gemini' ? '✨' : engine === 'ai' ? '🧠' : '🎧';
     info.textContent = eicon + ' ' + mp3Name + ' — guessed ' +
       notes.length + ' notes' + (engine !== 'dsp' && melodyOnly ? ' (melody line)' : '') +
-      ' at ~' + mp3Analysis.bpm + ' BPM. Tweak anything that sounds off!';
+      ' at ~' + bpm + ' BPM. Tweak anything that sounds off!';
     showAB();
   } catch (err) {
     info.textContent = 'Something went wrong reading that MP3 — try another one.';
