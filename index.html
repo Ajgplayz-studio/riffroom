@@ -164,7 +164,7 @@ if (location.hostname.indexOf('github.io') !== -1) {
 
     <div class="card">
       <h2>✨ AI Cover</h2>
-      <p class="hint" style="margin-top:0;">Choose an MP3 — the AI listens and guesses the notes, Songsterr-style. Works best on clear melodies. Everything runs in your browser; the file never leaves your device.</p>
+      <p class="hint" style="margin-top:0;">🧠 Real AI this time — Spotify's <b>Basic Pitch</b> neural net transcribes the MP3 right in your browser, chords and all. One-time ~2&nbsp;MB model download (needs internet). Everything stays on your device.</p>
       <div class="btnrow">
         <label class="btn ghost">🎵 Choose MP3<input type="file" id="mp3File" accept="audio/mpeg,audio/*" style="display:none;"></label>
         <button class="btn" id="genCover" onclick="generateCover()" disabled>✨ Guess the notes</button>
@@ -443,6 +443,7 @@ function extendSheet() {
 /* ================= AI cover (MP3) ================= */
 let mp3Analysis = null;
 let mp3Name = '';
+let mp3FileChosen = null;
 function fmtDur(s) { s = Math.round(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 async function analyzeMP3(file) {
   const raw = await file.arrayBuffer();
@@ -589,6 +590,7 @@ document.getElementById('mp3File').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   mp3Name = f.name;
+  mp3FileChosen = f;
   mp3Analysis = null;
   const info = document.getElementById('mp3Info');
   const gen = document.getElementById('genCover');
@@ -606,18 +608,93 @@ document.getElementById('mp3File').addEventListener('change', async (e) => {
     info.textContent = 'Could not read that file — try a different MP3.';
   }
 });
+// ---- real AI: Spotify's Basic Pitch neural net, in-browser via TF.js ----
+let aiLibPromise = null, aiModel = null;
+const BP_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json';
+function loadAILib() {
+  if (!aiLibPromise) aiLibPromise = import('https://esm.sh/@spotify/basic-pitch@1.0.1');
+  return aiLibPromise;
+}
+async function resample22050(file, maxSec) {
+  const raw = await file.arrayBuffer();
+  const buf = await ac().decodeAudioData(raw);
+  const dur = Math.min(buf.duration, maxSec || 240);
+  const off = new OfflineAudioContext(1, Math.ceil(dur * 22050), 22050);
+  const src = off.createBufferSource();
+  src.buffer = buf;
+  src.connect(off.destination);
+  src.start(0, 0, dur);
+  return (await off.startRendering()).getChannelData(0);
+}
+async function transcribeWithAI(mono22050, onProgress) {
+  const bp = await loadAILib();
+  if (!aiModel) aiModel = new bp.BasicPitch(BP_MODEL_URL);
+  const frames = [], onsets = [], contours = [];
+  await aiModel.evaluateModel(
+    mono22050,
+    (f, o, c) => { frames.push(...f); onsets.push(...o); contours.push(...c); },
+    (p) => { if (onProgress) onProgress(p); }
+  );
+  return bp.noteFramesToTime(
+    bp.addPitchBendsToNoteEvents(contours, bp.outputToNotesPoly(frames, onsets, 0.25, 0.25, 5))
+  );
+}
+function aiNotesToRiff(aiNotes, bpm) {
+  // merge same-pitch notes that overlap/touch (the model sometimes fragments).
+  // sort pitch-first so same-pitch notes are adjacent even in polyphony.
+  const sorted = aiNotes
+    .map(n => ({ t: n.startTimeSeconds, d: n.durationSeconds, m: Math.round(n.pitchMidi) }))
+    .filter(n => n.d > 0 && n.m >= 21 && n.m <= 108)
+    .sort((a, b) => a.m - b.m || a.t - b.t);
+  const merged = [];
+  sorted.forEach(n => {
+    const l = merged[merged.length - 1];
+    if (l && l.m === n.m && n.t <= l.t + l.d + 0.06) {
+      l.d = Math.max(l.d, (n.t + n.d) - l.t);
+    } else {
+      merged.push({ t: n.t, d: n.d, m: n.m });
+    }
+  });
+  const bps = bpm / 60;
+  return merged
+    .map(n => [
+      Math.round(n.t * bps * 4) / 4,
+      n.m,
+      Math.max(0.25, Math.round(n.d * bps * 4) / 4)
+    ])
+    .filter(n => n[2] > 0)
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, 2000);
+}
+
 async function generateCover() {
   const info = document.getElementById('mp3Info');
   const gen = document.getElementById('genCover');
-  if (!mp3Analysis) { info.textContent = 'Choose an MP3 first.'; return; }
+  if (!mp3FileChosen) { info.textContent = 'Choose an MP3 first.'; return; }
   syncSongFromInputs();
   gen.disabled = true;
-  info.textContent = '🎧 Guessing the notes… (a few seconds)';
-  await new Promise(r => setTimeout(r, 30)); // let the message paint first
   try {
-    const notes = await transcribeMelody(mp3Analysis.data, mp3Analysis.sr, mp3Analysis.bpm);
+    info.textContent = '🎧 Preparing audio…';
+    await new Promise(r => setTimeout(r, 30));
+    const mono = await resample22050(mp3FileChosen, 240);
+    let notes, engine;
+    try {
+      info.textContent = '🧠 Loading the AI (one-time download)…';
+      await new Promise(r => setTimeout(r, 30));
+      const aiNotes = await transcribeWithAI(mono, (p) => {
+        info.textContent = '🧠 AI is listening… ' + Math.round(p * 100) + '%';
+      });
+      notes = aiNotesToRiff(aiNotes, mp3Analysis.bpm);
+      engine = 'ai';
+    } catch (aiErr) {
+      // offline or CDN blocked: fall back to the classic DSP guesser
+      info.textContent = '⚠️ AI would not load — using the classic guesser instead…';
+      await new Promise(r => setTimeout(r, 30));
+      notes = await transcribeMelody(mp3Analysis.data, mp3Analysis.sr, mp3Analysis.bpm);
+      engine = 'dsp';
+    }
     if (!notes.length) {
-      info.textContent = 'Could not find a clear melody in that MP3 — try another one.';
+      info.textContent = 'Could not find notes in that MP3 — try another one.';
       gen.disabled = false;
       return;
     }
@@ -633,8 +710,8 @@ async function generateCover() {
     renderNoteList();
     renderSheet();
     document.getElementById('undoCover').style.display = '';
-    info.textContent = '🎧 ' + mp3Name + ' — guessed ' + notes.length + ' notes at ~' +
-      mp3Analysis.bpm + ' BPM. Tweak anything that sounds off!';
+    info.textContent = (engine === 'ai' ? '🧠' : '🎧') + ' ' + mp3Name + ' — guessed ' +
+      notes.length + ' notes at ~' + mp3Analysis.bpm + ' BPM. Tweak anything that sounds off!';
   } catch (err) {
     info.textContent = 'Something went wrong reading that MP3 — try another one.';
   }
